@@ -68,7 +68,7 @@ Source: "{#SourcePath}\..\x64\Debug\ZFSin\ZFSin.inf"; DestDir: "{app}"; Flags: i
 ;Source: "{#SourcePath}\..\ZFSin\ZFSin.inf"; DestDir: "{app}"; Flags: ignoreversion  
 Source: "{#SourcePath}\HowToDebug.txt"; DestDir: "{app}"; Flags: ignoreversion  
 Source: "{#SourcePath}\..\x64\Debug\*.pdb"; DestDir: "{app}\symbols"; Flags: ignoreversion  
-Source: "{#SourcePath}\..\vcruntime140d.dll"; DestDir: "{app}"; Flags: ignoreversion  
+;Source: "{#SourcePath}\..\vcruntime140d.dll"; DestDir: "{app}"; Flags: ignoreversion  
 
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
