@@ -64,7 +64,7 @@ Source: "{#SourcePath}\..\x64\Debug\*.exe"; DestDir: "{app}"; Flags: ignoreversi
 Source: "{#SourcePath}\..\x64\Debug\ZFSin\ZFSin.sys"; DestDir: "{app}"; Flags: ignoreversion 
 Source: "{#SourcePath}\..\x64\Debug\ZFSin\ZFSin.cat"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}\..\x64\Debug\ZFSin\ZFSin.inf"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}\..\ZFSin.cer"; DestDir: "{app}"; Flags: ignoreversion  
+;Source: "{#SourcePath}\..\ZFSin.cer"; DestDir: "{app}"; Flags: ignoreversion  
 ;Source: "{#SourcePath}\..\ZFSin\ZFSin.inf"; DestDir: "{app}"; Flags: ignoreversion  
 Source: "{#SourcePath}\HowToDebug.txt"; DestDir: "{app}"; Flags: ignoreversion  
 Source: "{#SourcePath}\..\x64\Debug\*.pdb"; DestDir: "{app}\symbols"; Flags: ignoreversion  
