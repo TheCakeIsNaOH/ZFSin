@@ -8,6 +8,6 @@ build:
   parallel: true
   verbosity: minimal
 after_build:
-- cmd: issc "C:\projects\zfsin\zfsinstaller\ZFSInstall-debug.iss"
+- cmd: iscc "C:\projects\zfsin\zfsinstaller\ZFSInstall-debug.iss"
 artifacts:
 - path: OpenZFSOnWindows-debug.exe
