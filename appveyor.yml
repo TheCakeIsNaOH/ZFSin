@@ -2,5 +2,12 @@ version: 1.0.{build}
 image: Visual Studio 2017
 configuration: Debug
 platform: x64
+install:
+- cmd: set PATH="C:\Program Files (x86)\Inno Setup 5";%PATH%
 build:
+  parallel: true
   verbosity: minimal
+after_build:
+- cmd: issc "C:\projects\zfsin\zfsinstaller\ZFSInstall-debug.iss"
+artifacts:
+- path: OpenZFSOnWindows-debug.exe
