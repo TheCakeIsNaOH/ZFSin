@@ -35,8 +35,8 @@ ChangesEnvironment=true
 WizardSmallImageFile="{#SourcePath}\Small.bmp"
 WizardImageFile="{#SourcePath}\Large.bmp"
 ; Tools/Configure Sign Tools -> Add -> "signtool" = "signtool.exe $p"
-SignTool=signtool sign /sha1 ab8e4f6b94cecfa4638847122b511e507e147c50 /n $qJoergen Lundman$q /t http://timestamp.digicert.com /fd sha1 /d $qOpenZFS on Windows$q $f
-SignTool=signtool sign /sha1 ab8e4f6b94cecfa4638847122b511e507e147c50 /as /n $qJoergen Lundman$q /tr http://timestamp.digicert.com /td sha256 /fd sha256 /d $qOpenZFS on Windows$q $f
+;SignTool=signtool sign /sha1 ab8e4f6b94cecfa4638847122b511e507e147c50 /n $qJoergen Lundman$q /t http://timestamp.digicert.com /fd sha1 /d $qOpenZFS on Windows$q $f
+;SignTool=signtool sign /sha1 ab8e4f6b94cecfa4638847122b511e507e147c50 /as /n $qJoergen Lundman$q /tr http://timestamp.digicert.com /td sha256 /fd sha256 /d $qOpenZFS on Windows$q $f
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
