@@ -45,7 +45,8 @@ struct zfs_dirlist {
 	uint32_t dir_eof;			// Directory listing completed?
 	uint64_t uio_offset;		// Directory list offset
 	uint64_t ea_index;			// EA list offset
-	int ContainsWildCards;      // searchname has wildcards
+	uint32_t deleteonclose;		// Marked for deletion
+	uint32_t ContainsWildCards;      // searchname has wildcards
 	UNICODE_STRING searchname;  // Search pattern
 };
 
@@ -64,6 +65,9 @@ extern void zfs_send_notify(zfsvfs_t *zfsvfs, char *name, int, ULONG FilterMatch
 extern void zfs_send_notify_stream(zfsvfs_t *, char *, int, ULONG, ULONG, char *stream);
 extern void zfs_set_security(struct vnode *vp, struct vnode *dvp);
 extern uint64_t zfs_sid2uid(SID *sid);
+
+BOOLEAN vattr_apply_lx_ea(vattr_t *vap, PFILE_FULL_EA_INFORMATION ea);
+NTSTATUS vnode_apply_eas(struct vnode *vp, PFILE_FULL_EA_INFORMATION eas, ULONG eaLength, PULONG pEaErrorOffset);
 
 extern NTSTATUS zfsdev_open(dev_t dev, PIRP Irp);
 extern NTSTATUS zfsdev_release(dev_t dev, PIRP Irp);
@@ -93,7 +97,7 @@ extern int	pn_free(pathname_t *p);
 extern int	zfs_vnop_ioctl_fullfsync(struct vnode *, vfs_context_t *, zfsvfs_t *);
 extern int	zfs_setwinflags(znode_t *zp, uint32_t winflags);
 extern uint32_t zfs_getwinflags(znode_t *zp);
-extern NTSTATUS zfs_setunlink(vnode_t *vp, vnode_t *dvp);
+extern NTSTATUS zfs_setunlink(FILE_OBJECT *fo, vnode_t *dvp);
 extern int zfs_find_dvp_vp(zfsvfs_t *, char *, int finalpartmaynotexist,
 	int finalpartmustnotexist, char **lastname, struct vnode **dvpp,
 	struct vnode **vpp, int flags);

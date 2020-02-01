@@ -326,6 +326,8 @@ char *common_status_str(NTSTATUS Status)
 		return "STATUS_NOT_FOUND";
 	case STATUS_NO_MORE_EAS:
 		return "STATUS_NO_MORE_EAS";
+	case STATUS_NO_EAS_ON_FILE:
+		return "STATUS_NO_EAS_ON_FILE";
 	default:
 		return "<*****>";
 	}
@@ -532,6 +534,134 @@ zfs_setwinflags(znode_t *zp, uint32_t winflags)
 	}
 
 	return 0;
+}
+
+// WSL uses special EAs to interact with uid/gid/mode/device major/minor
+// Returns: TRUE if the EA was stored in the vattr.
+BOOLEAN vattr_apply_lx_ea(vattr_t *vap, PFILE_FULL_EA_INFORMATION ea)
+{
+	BOOLEAN setVap = FALSE;
+
+	if (ea->EaNameLength != 6 || strncmp(ea->EaName, "$LX", 3) != 0)
+		return FALSE;
+
+	void *eaValue = &ea->EaName[0] + ea->EaNameLength + 1;
+	if (strncmp(ea->EaName, LX_FILE_METADATA_UID_EA_NAME, ea->EaNameLength) == 0) {
+		vap->va_uid = *(PUINT32)eaValue;
+		vap->va_active |= AT_UID;
+		setVap = TRUE;
+	} else if (strncmp(ea->EaName, LX_FILE_METADATA_GID_EA_NAME, ea->EaNameLength) == 0) {
+		vap->va_gid = *(PUINT32)eaValue;
+		vap->va_active |= AT_GID;
+		setVap = TRUE;
+	} else if (strncmp(ea->EaName, LX_FILE_METADATA_MODE_EA_NAME, ea->EaNameLength) == 0) {
+		vap->va_mode = *(PUINT32)eaValue;
+		vap->va_active |= AT_MODE;
+		setVap = TRUE;
+	} else if (strncmp(ea->EaName, LX_FILE_METADATA_DEVICE_ID_EA_NAME, ea->EaNameLength) == 0) {
+		UINT32 *vu32 = (UINT32*)eaValue;
+		vap->va_rdev = makedev(vu32[0], vu32[1]);
+		vap->va_active |= VNODE_ATTR_va_rdev;
+		setVap = TRUE;
+	}
+	return setVap;
+}
+
+static int vnode_apply_single_ea(struct vnode *vp, struct vnode *xdvp, FILE_FULL_EA_INFORMATION *ea)
+{
+	int error;
+	struct vnode *xvp = NULL;
+
+	dprintf("%s: xattr '%.*s' valuelen %u\n", __func__,
+		ea->EaNameLength, ea->EaName, ea->EaValueLength);
+
+	if (ea->EaValueLength == 0) {
+
+		// Remove EA
+		error = zfs_remove(xdvp, ea->EaName, NULL, NULL, /* flags */0);
+
+	} else {
+		// Add replace EA
+
+		error = zfs_obtain_xattr(VTOZ(xdvp), ea->EaName, VTOZ(vp)->z_mode, NULL,
+			&xvp, 0);
+		if (error)
+			goto out;
+
+		/* Truncate, if it was existing */
+		error = zfs_freesp(VTOZ(xvp), 0, 0, VTOZ(vp)->z_mode, TRUE);
+
+		/* Write data */
+		uio_t *uio;
+		uio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
+		uio_addiov(uio, ea->EaName + ea->EaNameLength + 1, ea->EaValueLength);
+		error = zfs_write(xvp, uio, 0, NULL, NULL);
+		uio_free(uio);
+	}
+
+out:
+	if (xvp != NULL)
+		VN_RELE(xvp);
+
+	return error;
+}
+
+
+/*
+ * Apply a set of EAs to a vnode, while handling special Windows EAs that set UID/GID/Mode/rdev.
+ */
+NTSTATUS vnode_apply_eas(struct vnode *vp, PFILE_FULL_EA_INFORMATION eas, ULONG eaLength, PULONG pEaErrorOffset)
+{
+	NTSTATUS Status = STATUS_SUCCESS;
+
+	if (vp == NULL || eas == NULL) return STATUS_INVALID_PARAMETER;
+
+	// Optional: Check for validity if the caller wants it.
+	if (pEaErrorOffset != NULL) {
+		Status = IoCheckEaBufferValidity(eas, eaLength, pEaErrorOffset);
+		if (!NT_SUCCESS(Status)) {
+			dprintf("%s: failed validity: 0x%x\n", __func__, Status);
+			return Status;
+		}
+	}
+
+	struct vnode *xdvp = NULL;
+	vattr_t vap = { 0 };
+	int error;
+	for (PFILE_FULL_EA_INFORMATION ea = eas; ; ea = (PFILE_FULL_EA_INFORMATION)((uint8_t*)ea + ea->NextEntryOffset)) {
+		if (vattr_apply_lx_ea(&vap, ea)) {
+			dprintf("  encountered special attrs EA '%.*s'\n", ea->EaNameLength, ea->EaName);
+		} else {
+			// optimization: defer creating an xattr dir until the first standard EA
+			if (xdvp == NULL) {
+				// Open (or Create) the xattr directory
+				if (zfs_get_xattrdir(VTOZ(vp), &xdvp, NULL, CREATE_XATTR_DIR) != 0) {
+					Status = STATUS_EA_CORRUPT_ERROR;
+					goto out;
+				}
+			}
+			error = vnode_apply_single_ea(vp, xdvp, ea);
+			if (error != 0) dprintf("  failed to process xattr: %d\n", error);
+		}
+
+		if (ea->NextEntryOffset == 0)
+			break;
+	}
+
+	// We should perhaps translate some of the "error" codes we can
+	// get here, into Status return values. Currently, all errors are
+	// masked, and we always return OK.
+
+	// Update zp based on LX eas.
+	if (vap.va_active != 0)
+		zfs_setattr(vp, &vap, 0, NULL, NULL);
+
+out:
+	if (xdvp != NULL) {
+		VN_RELE(xdvp);
+	}
+
+	return Status;
 }
 
 /*
@@ -1262,7 +1392,10 @@ int zfs_build_path(znode_t *start_zp, znode_t *start_parent, char **fullpath, ui
 			VERIFY(sa_lookup(zp->z_sa_hdl, SA_ZPL_PARENT(zfsvfs),
 				&parent, sizeof(parent)) == 0);
 			error = zfs_zget(zfsvfs, parent, &dzp);
-			if (error) goto failed;
+			if (error) {
+				dprintf("%s: zget failed %d\n", __func__, error);
+				goto failed;
+			}
 		}
 		// dzp held from here.
 
@@ -1270,13 +1403,18 @@ int zfs_build_path(znode_t *start_zp, znode_t *start_parent, char **fullpath, ui
 		if (zp->z_id == zfsvfs->z_root)
 			strlcpy(name, "", MAXPATHLEN);  // Empty string, as we add "\\" below
 		else
-			if (zap_value_search(zfsvfs->z_os, parent, zp->z_id,
-				ZFS_DIRENT_OBJ(-1ULL), name) != 0) goto failed;
-
+			if ((error = zap_value_search(zfsvfs->z_os, parent, zp->z_id,
+				ZFS_DIRENT_OBJ(-1ULL), name)) != 0) {
+				dprintf("%s: zap_value_search failed %d\n", __func__, error);
+				goto failed;
+			}
 		// Copy in name.
 		part = strlen(name);
 		// Check there is room
-		if (part + 1 > index) goto failed;
+		if (part + 1 > index) {
+			dprintf("%s: out of space\n", __func__);
+			goto failed;
+		}
 
 		index -= part;
 		memcpy(&work[index], name, part);
@@ -1317,7 +1455,6 @@ int zfs_build_path(znode_t *start_zp, znode_t *start_parent, char **fullpath, ui
 failed:
 	if (zp) VN_RELE(ZTOV(zp));
 	if (dzp) VN_RELE(ZTOV(dzp));
-
 	kmem_free(work, MAXPATHLEN * 2);
 	return -1;
 }
@@ -1332,8 +1469,6 @@ void zfs_send_notify_stream(zfsvfs_t *zfsvfs, char *name, int nameoffset, ULONG 
 	zmo = zfsvfs->z_vfs;
 	UNICODE_STRING ustr;
 	UNICODE_STRING ustream;
-
-	ASSERT(nameoffset <= strlen(name));
 
 	AsciiStringToUnicodeString(name, &ustr);
 
@@ -1373,7 +1508,8 @@ void zfs_uid2sid(uint64_t uid, SID **sid)
 	// Root?
 	num = (uid == 0) ? 1 : 2;
 
-	tmp = kmem_zalloc(offsetof(SID, SubAuthority) + (num * sizeof(ULONG)), KM_SLEEP);
+	tmp = ExAllocatePoolWithTag(PagedPool,
+		offsetof(SID, SubAuthority) + (num * sizeof(ULONG)), 'zsid');
 
 	tmp->Revision = 1;
 	tmp->SubAuthorityCount = num;
@@ -1421,7 +1557,8 @@ void zfs_gid2sid(uint64_t gid, SID **sid)
 
 	ASSERT(sid != NULL);
 
-	tmp = kmem_zalloc(offsetof(SID, SubAuthority) + (num * sizeof(ULONG)), KM_SLEEP);
+	tmp = ExAllocatePoolWithTag(PagedPool,
+		offsetof(SID, SubAuthority) + (num * sizeof(ULONG)), 'zsid');
 
 	tmp->Revision = 1;
 	tmp->SubAuthorityCount = num;
@@ -1441,7 +1578,7 @@ void zfs_gid2sid(uint64_t gid, SID **sid)
 void zfs_freesid(SID *sid)
 {
 	ASSERT(sid != NULL);
-	kmem_free(sid, offsetof(SID, SubAuthority) + (sid->SubAuthorityCount * sizeof(ULONG)));
+	ExFreePool(sid);
 }
 
 
@@ -1540,6 +1677,7 @@ void zfs_set_security(struct vnode *vp, struct vnode *dvp)
 {
 	SECURITY_SUBJECT_CONTEXT subjcont;
 	NTSTATUS Status;
+	SID *usersid = NULL, *groupsid = NULL;
 
 	if (vp == NULL) return;
 
@@ -1592,8 +1730,6 @@ void zfs_set_security(struct vnode *vp, struct vnode *dvp)
 	if (Status != STATUS_SUCCESS) goto err;
 
 	vnode_setsecurity(vp, sd);
-
-	SID *usersid = NULL, *groupsid = NULL;
 
 	zfs_uid2sid(zp->z_uid, &usersid);
 	RtlSetOwnerSecurityDescriptor(&sd, usersid, FALSE);
@@ -1698,9 +1834,17 @@ out:
  * Call vnode_setunlink if zfs_zaccess_delete() allows it
  * TODO: provide credentials
  */
-NTSTATUS zfs_setunlink(vnode_t *vp, vnode_t *dvp) {
-
+NTSTATUS zfs_setunlink(FILE_OBJECT *fo, vnode_t *dvp) 
+{
+	vnode_t *vp;
 	NTSTATUS Status = STATUS_UNSUCCESSFUL;
+
+	if (fo == NULL) {
+		Status = STATUS_INVALID_PARAMETER;
+		goto err;
+	}
+
+	vp = fo->FsContext;
 
 	if (vp == NULL) {
 		Status = STATUS_INVALID_PARAMETER;
@@ -1709,14 +1853,15 @@ NTSTATUS zfs_setunlink(vnode_t *vp, vnode_t *dvp) {
 
 	znode_t *zp = NULL;
 	znode_t *dzp = NULL;
+	zfs_dirlist_t *zccb = fo->FsContext2;
+
 	zfsvfs_t *zfsvfs;
 	VN_HOLD(vp);
 	zp = VTOZ(vp);
 
 	if (vp && zp) {
 		zfsvfs = zp->z_zfsvfs;
-	}
-	else {
+	} else {
 		Status = STATUS_INVALID_PARAMETER;
 		goto err;
 	}
@@ -1724,6 +1869,13 @@ NTSTATUS zfs_setunlink(vnode_t *vp, vnode_t *dvp) {
 	if (zfsvfs->z_rdonly || vfs_isrdonly(zfsvfs->z_vfs) ||
 		!spa_writeable(dmu_objset_spa(zfsvfs->z_os))) {
 		Status = STATUS_MEDIA_WRITE_PROTECTED;
+		goto err;
+	}
+
+	// Cannot delete a user mapped image.
+	if (!MmFlushImageSection(&vp->SectionObjectPointers,
+		MmFlushForDelete)) {
+		Status = STATUS_CANNOT_DELETE;
 		goto err;
 	}
 
@@ -1747,24 +1899,17 @@ NTSTATUS zfs_setunlink(vnode_t *vp, vnode_t *dvp) {
 		VN_HOLD(dvp);
 	}
 
+	// If we are root
+	if (zp->z_id == zfsvfs->z_root) {
+		Status = STATUS_CANNOT_DELETE;
+		goto err;
+	}
 
 	// If we are a dir, and have more than "." and "..", we
 	// are not empty.
 	if (S_ISDIR(zp->z_mode)) {
 
 		int nodeadlock = 0;
-		// We might have some files being removed awaiting reclaim
-		// delayclose() will return 1 as long as there exists vnodes with
-		// unlinked set but not yet reclaimed.
-		// We could optionally drop our iocount here, and try to take it again
-		// handling the case where it may have been deleted after drain.
-		while (zp->z_size == 3 &&
-			vnode_drain_delayclose(1) >= 1) {
-			dprintf("%s: delete_pending waiting\n", __func__);
-			delay(1);
-			// This crutch should not be needed, in theory
-			if (nodeadlock++ > 10) break;
-		}
 
 		if (zp->z_size > 2) {
 			Status = STATUS_DIRECTORY_NOT_EMPTY;
@@ -1775,7 +1920,9 @@ NTSTATUS zfs_setunlink(vnode_t *vp, vnode_t *dvp) {
 	int error = zfs_zaccess_delete(dzp, zp, 0);
 
 	if (error == 0) {
-		vnode_setdeleteonclose(vp);
+		ASSERT3P(zccb, != , NULL);
+		zccb->deleteonclose = 1;
+		fo->DeletePending = TRUE;
 		Status = STATUS_SUCCESS;
 	}
 	else {
@@ -1809,6 +1956,7 @@ NTSTATUS file_disposition_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO
 
 	PFILE_OBJECT FileObject = IrpSp->FileObject;
 	struct vnode *vp = FileObject->FsContext;
+	zfs_dirlist_t *zccb = FileObject->FsContext2;
 	znode_t *zp = VTOZ(vp);
 	zfsvfs_t *zfsvfs = zp->z_zfsvfs;
 	FILE_DISPOSITION_INFORMATION *fdi = Irp->AssociatedIrp.SystemBuffer;
@@ -1819,11 +1967,12 @@ NTSTATUS file_disposition_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO
 			fdi->DeleteFile ? "set" : "unset",
 			IrpSp->FileObject->FileName);
 		Status = STATUS_SUCCESS;
-		if (fdi->DeleteFile)
-			Status = zfs_setunlink(vp, NULL);
-		else
-			vnode_cleardeleteonclose(vp);
-
+		if (fdi->DeleteFile) {
+			Status = zfs_setunlink(IrpSp->FileObject, NULL);
+		} else {
+			if (zccb) zccb->deleteonclose = 0;
+			FileObject->DeletePending = FALSE;
+		}
 		// Dirs marked for Deletion should release all pending Notify events
 		if (Status == STATUS_SUCCESS && fdi->DeleteFile) {
 			FsRtlNotifyCleanup(zmo->NotifySync, &zmo->DirNotifyList, VTOZ(vp));
@@ -1841,6 +1990,7 @@ NTSTATUS file_disposition_information_ex(PDEVICE_OBJECT DeviceObject, PIRP Irp, 
 
 	PFILE_OBJECT FileObject = IrpSp->FileObject;
 	struct vnode *vp = FileObject->FsContext;
+	zfs_dirlist_t *zccb = FileObject->FsContext2;
 	znode_t *zp = VTOZ(vp);
 	zfsvfs_t *zfsvfs = zp->z_zfsvfs;
 	FILE_DISPOSITION_INFORMATION_EX *fdie = Irp->AssociatedIrp.SystemBuffer;
@@ -1854,10 +2004,10 @@ NTSTATUS file_disposition_information_ex(PDEVICE_OBJECT DeviceObject, PIRP Irp, 
 
 		if (fdie->Flags | FILE_DISPOSITION_ON_CLOSE)
 			if (fdie->Flags | FILE_DISPOSITION_DELETE)
-				Status = zfs_setunlink(vp, NULL);
+				Status = zfs_setunlink(FileObject, NULL);
 			else
-				vnode_cleardeleteonclose(vp);
-
+				if (zccb) zccb->deleteonclose = 0;
+		
 		// Do we care about FILE_DISPOSITION_POSIX_SEMANTICS ?
 
 		// Dirs marked for Deletion should release all pending Notify events
@@ -1877,6 +2027,7 @@ NTSTATUS file_endoffile_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_S
 
 	PFILE_OBJECT FileObject = IrpSp->FileObject;
 	struct vnode *vp = FileObject->FsContext;
+	zfs_dirlist_t *zccb = FileObject->FsContext2;
 	znode_t *zp = VTOZ(vp);
 	zfsvfs_t *zfsvfs = zp->z_zfsvfs;
 	FILE_END_OF_FILE_INFORMATION *feofi = Irp->AssociatedIrp.SystemBuffer;
@@ -1910,7 +2061,7 @@ NTSTATUS file_endoffile_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_S
 	if (!zfsvfs->z_unmounted) {
 
 		// Can't be done on DeleteOnClose
-		if (vnode_deleteonclose(vp))
+		if (zccb && zccb->deleteonclose)
 			goto out;
 
 		// Advance only?
@@ -1960,7 +2111,9 @@ out:
 	}
 
 	if (CacheMapInitialized) {
+		dprintf("other uninit\n");
 		CcUninitializeCacheMap(FileObject, NULL, NULL);
+		dprintf("done uninit\n");
 	}
 
 	// We handled setsize in here.
@@ -2175,10 +2328,14 @@ NTSTATUS file_rename_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STAC
 		OBJECT_ATTRIBUTES oa;
 		IO_STATUS_BLOCK ioStatus;
 		UNICODE_STRING uFileName;
-		RtlInitUnicodeString(&uFileName, ren->FileName);
+		//RtlInitEmptyUnicodeString(&uFileName, ren->FileName, ren->FileNameLength);  // doesn't set length
+		// Is there really no offical wrapper to do this?
+		uFileName.Length = uFileName.MaximumLength = ren->FileNameLength;
+		uFileName.Buffer = ren->FileName;
+
 		InitializeObjectAttributes(&oa, &uFileName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
 			NULL, NULL);
-
+		
 		Status = IoCreateFile(
 			&destParentHandle,
 			FILE_READ_DATA,
@@ -2460,6 +2617,7 @@ NTSTATUS file_standard_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_ST
 	standard->NumberOfLinks = 1;
 	if (IrpSp->FileObject && IrpSp->FileObject->FsContext) {
 		struct vnode *vp = IrpSp->FileObject->FsContext;
+		zfs_dirlist_t *zccb = IrpSp->FileObject->FsContext2;
 		VN_HOLD(vp);
 		znode_t *zp = VTOZ(vp);
 		standard->Directory = vnode_isdir(vp) ? TRUE : FALSE;
@@ -2469,7 +2627,7 @@ NTSTATUS file_standard_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_ST
 		//standard->AllocationSize.QuadPart = zp->z_size;  // space taken on disk, multiples of block size
 		standard->EndOfFile.QuadPart = vnode_isdir(vp) ? 0 : zp->z_size;       // byte size of file
 		standard->NumberOfLinks = zp->z_links;
-		standard->DeletePending = vnode_deleteonclose(vp) ? TRUE : FALSE;
+		standard->DeletePending = zccb && zccb->deleteonclose ? TRUE : FALSE;
 		VN_RELE(vp);
 		dprintf("Returning size %llu and allocsize %llu\n",
 			standard->EndOfFile.QuadPart, standard->AllocationSize.QuadPart);
@@ -2572,12 +2730,13 @@ NTSTATUS file_standard_link_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, P
 
 	if (IrpSp->FileObject && IrpSp->FileObject->FsContext) {
 		struct vnode *vp = IrpSp->FileObject->FsContext;
+		zfs_dirlist_t *zccb = IrpSp->FileObject->FsContext2;
 
 		znode_t *zp = VTOZ(vp);
 
 		fsli->NumberOfAccessibleLinks = zp->z_links;
 		fsli->TotalNumberOfLinks = zp->z_links;
-		fsli->DeletePending = vnode_deleteonclose(vp);
+		fsli->DeletePending = zccb && zccb->deleteonclose ? TRUE : FALSE;
 		fsli->Directory = S_ISDIR(zp->z_mode);
 	}
 
@@ -2669,10 +2828,33 @@ NTSTATUS file_stat_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_
 		fsi->FileAttributes = zfs_getwinflags(zp);
 		fsi->ReparseTag = 0;
 		fsi->NumberOfLinks = zp->z_links;
-		fsi->EffectiveAccess = 0;
+		fsi->EffectiveAccess = GENERIC_ALL;
 	}
 
 	return STATUS_SUCCESS;
+}
+
+// Convert ZFS (Unix) mode to Windows mode.
+ULONG ZMODE2WMODE(mode_t z)
+{
+	ULONG w = 0;
+
+	if (S_ISDIR(z)) w |= 0x4000; // _S_IFDIR
+	if (S_ISREG(z)) w |= 0x8000; // _S_IFREG
+	if (S_ISCHR(z)) w |= 0x2000; // _S_IFCHR
+	if (S_ISFIFO(z)) w |= 0x1000; // _S_IFIFO
+	if ((z&S_IRUSR) == S_IRUSR) w |= 0x0100; // _S_IREAD
+	if ((z&S_IWUSR) == S_IWUSR) w |= 0x0080; // _S_IWRITE
+	if ((z&S_IXUSR) == S_IXUSR) w |= 0x0040; // _S_IEXEC
+	// Couldn't find documentation for the following, but
+	// tested in lx/ubuntu to be correct.
+	if ((z&S_IRGRP) == S_IRGRP) w |= 0x0020; //
+	if ((z&S_IWGRP) == S_IWGRP) w |= 0x0010; //
+	if ((z&S_IXGRP) == S_IXGRP) w |= 0x0008; //
+	if ((z&S_IROTH) == S_IROTH) w |= 0x0004; //
+	if ((z&S_IWOTH) == S_IWOTH) w |= 0x0002; //
+	if ((z&S_IXOTH) == S_IXOTH) w |= 0x0001; //
+	return w;
 }
 
 NTSTATUS file_stat_lx_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp, FILE_STAT_LX_INFORMATION *fsli)
@@ -2708,12 +2890,12 @@ NTSTATUS file_stat_lx_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STA
 		fsli->FileAttributes = zfs_getwinflags(zp);
 		fsli->ReparseTag = 0;
 		fsli->NumberOfLinks = zp->z_links;
-		fsli->EffectiveAccess = 0;
+		fsli->EffectiveAccess = SPECIFIC_RIGHTS_ALL | ACCESS_SYSTEM_SECURITY;
 		fsli->LxFlags = LX_FILE_METADATA_HAS_UID | LX_FILE_METADATA_HAS_GID | LX_FILE_METADATA_HAS_MODE;
 		if (zfsvfs->z_case == ZFS_CASE_SENSITIVE) fsli->LxFlags |= LX_FILE_CASE_SENSITIVE_DIR;
 		fsli->LxUid = zp->z_uid;
 		fsli->LxGid = zp->z_gid;
-		fsli->LxMode = zp->z_mode;
+		fsli->LxMode = ZMODE2WMODE(zp->z_mode);
 		fsli->LxDeviceIdMajor = 0;
 		fsli->LxDeviceIdMinor = 0;
 	}
@@ -2752,17 +2934,22 @@ NTSTATUS file_name_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_
 
 	if (zp->z_id == zfsvfs->z_root) {
 		strlcpy(strname, "\\", MAXPATHLEN);
-	}
-	else {
+	} else {
 
 		if (zp->z_name_cache != NULL) {
-			// Apparently we always reply with fullname. 
-			// Normalize seems to mean; do-not-use-short-8x3-names
 			strlcpy(strname, zp->z_name_cache,
 				MAXPATHLEN);
-		}
-		else {
-			// Should never be used, in theory
+
+			// If it is a DIR, make sure it ends with "\", except for
+			// root, that is just "\"
+			if (S_ISDIR(zp->z_mode))
+				strlcat(strname, "\\",
+					MAXPATHLEN);
+
+		} else {
+			// Should never be used, in theory - as it is wrong.
+			// should then call build_path().
+			DbgBreakPoint();
 			VERIFY(sa_lookup(zp->z_sa_hdl, SA_ZPL_PARENT(zfsvfs),
 				&parent, sizeof(parent)) == 0);
 

@@ -6772,7 +6772,7 @@ zfs_ioctl_register_dataset_modify(zfs_ioc_t ioc, zfs_ioc_legacy_func_t *func,
 	zfs_ioctl_register_legacy(ioc, func, secpolicy,
 							  DATASET_NAME, B_TRUE, POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY);
 }
-
+extern PDRIVER_UNLOAD STOR_DriverUnload;
 uint64_t
 zfs_ioc_unregister_fs(void) 
 {
@@ -6785,6 +6785,10 @@ zfs_ioc_unregister_fs(void)
 	IoUnregisterFileSystem(fsDiskDeviceObject);
 	IoDeleteDevice(fsDiskDeviceObject);
 	IoDeleteDevice(ioctlDeviceObject);
+	if (STOR_DriverUnload != NULL) {
+		STOR_DriverUnload(WIN_DriverObject);
+		STOR_DriverUnload = NULL;
+	}
 	return 0;
 }
 
@@ -7964,7 +7968,7 @@ zfs_attach(void)
 	WIN_DriverObject->MajorFunction[IRP_MJ_QUERY_SECURITY] = (PDRIVER_DISPATCH)dispatcher;
 	WIN_DriverObject->MajorFunction[IRP_MJ_SET_SECURITY] = (PDRIVER_DISPATCH)dispatcher;
 
-
+#if 0
 	// Register some locking callback thingy
 	extern NTSTATUS ZFSCallbackAcquireForCreateSection(
 		IN PFS_FILTER_CALLBACK_DATA CallbackData,
@@ -8002,6 +8006,7 @@ zfs_attach(void)
 		&FilterCallbacks);
 	if (Status != STATUS_SUCCESS)
 		dprintf("%s: FsRtlRegisterFileSystemFilterCallbacks failed - no mmap for you\n", __func__);
+#endif
 
 	// Dump all registered filesystems
 	ntStatus = IoRegisterFsRegistrationChange(WIN_DriverObject, DriverNotificationRoutine);

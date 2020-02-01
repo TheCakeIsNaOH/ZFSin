@@ -30,8 +30,10 @@ void ZFSin_Fini(PDRIVER_OBJECT  DriverObject)
 {
 	KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "ZFSin_Fini\n"));
 	zfs_stop();
-	if (STOR_DriverUnload != NULL)
+	if (STOR_DriverUnload != NULL) {
 		STOR_DriverUnload(DriverObject);
+		STOR_DriverUnload = NULL;
+	}
 
 	kstat_osx_fini();
 	spl_stop();
@@ -99,7 +101,7 @@ void spl_create_hostid(HANDLE h, PUNICODE_STRING pRegistryPath)
 	Length = sizeof(KEY_VALUE_FULL_INFORMATION) + AttachKey.Length * sizeof(WCHAR) + sizeof(unsigned long);
 
 	PKEY_VALUE_FULL_INFORMATION   keyValue;
-	keyValue = ExAllocatePoolWithTag(NonPagedPool,
+	keyValue = ExAllocatePoolWithTag(NonPagedPoolNx,
 		Length,
 		'geRa');
 
@@ -223,7 +225,7 @@ int spl_kstat_registry(PUNICODE_STRING pRegistryPath, kstat_t *ksp)
 			break; // Something is wrong - or we finished
 
 		// Allocate space to hold
-		regBuffer = (PKEY_VALUE_FULL_INFORMATION)ExAllocatePoolWithTag(NonPagedPool, length, 'zfsr');
+		regBuffer = (PKEY_VALUE_FULL_INFORMATION)ExAllocatePoolWithTag(NonPagedPoolNx, length, 'zfsr');
 
 		if (regBuffer == NULL)
 			continue;

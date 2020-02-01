@@ -95,8 +95,6 @@ unsigned int zfs_vnop_ignore_negatives = 0;
 unsigned int zfs_vnop_ignore_positives = 0;
 unsigned int zfs_vnop_create_negatives = 1;
 
-static uint64_t delete_pending = 0;
-
 #endif
 
 #ifdef ALLOC_PRAGMA
@@ -198,25 +196,34 @@ CACHE_MANAGER_CALLBACKS CacheManagerCallbacks =
 };
 
 
-
 /*
  * zfs vfs operations.
  */
-zfs_dirlist_t *zfs_dirlist_alloc(void)
+
+/*
+ * FileObject->FsContext will point to vnode, many FileObjects can point to same vnode.
+ * FileObject->FsContext2 will point to own "zfs_dirlist_t" and be unique to each FileObject.
+ * - which could also be done with TSD data, but this appears to be the Windows norm.
+ */
+void zfs_couplefileobject(vnode_t *vp, FILE_OBJECT *fileobject, uint64_t size)
 {
+	ASSERT3P(fileobject->FsContext2, == , NULL);
 	zfs_dirlist_t *zccb = kmem_zalloc(sizeof(zfs_dirlist_t), KM_SLEEP);
 	zccb->magic = ZFS_DIRLIST_MAGIC;
-	return zccb;
+	fileobject->FsContext2 = zccb;
+
+	vnode_couplefileobject(vp, fileobject, size);
 }
 
-void zfs_dirlist_free(zfs_dirlist_t *zccb)
+void zfs_decouplefileobject(vnode_t *vp, FILE_OBJECT *fileobject)
 {
-	if (zccb->magic == ZFS_DIRLIST_MAGIC) {
-		zccb->magic = 0;
-		if (zccb->searchname.Buffer && zccb->searchname.Length)
-			kmem_free(zccb->searchname.Buffer, zccb->searchname.MaximumLength);
-		kmem_free(zccb, sizeof(zfs_dirlist_t));
-	}
+	// We release FsContext2 at CLEANUP, but fastfat releases it in
+	// CLOSE. Does this matter?
+	ASSERT3P(fileobject->FsContext2, != , NULL);
+	kmem_free(fileobject->FsContext2, sizeof(zfs_dirlist_t));
+	fileobject->FsContext2 = NULL;
+
+	vnode_decouplefileobject(vp, fileobject);
 }
 
 /*
@@ -335,13 +342,7 @@ int zfs_find_dvp_vp(zfsvfs_t *zfsvfs, char *filename, int finalpartmaynotexist, 
 		error = zfs_lookup(dvp, word,
 			&vp, &cn, cn.cn_nameiop, NULL, flags);
 
-		if (error != 0 || vnode_deleted(vp)) {
-			if (vp && vnode_deleted(vp)) {
-				dprintf("deleted, simulating ENOENT\n");
-				error = (vnode_isdir(vp) ? ESRCH : ENOENT);
-				VN_RELE(vp);
-				vp = NULL;
-			}
+		if (error != 0) {
 			// If we are creating a file, or looking up parent,
 			// allow it not to exist
 			if (finalpartmaynotexist) break;
@@ -381,6 +382,7 @@ int zfs_find_dvp_vp(zfsvfs_t *zfsvfs, char *filename, int finalpartmaynotexist, 
 				// We overload the lastname thing a bit, to return the reparsebuffer
 				if (lastname) *lastname = (char *)rpb;
 				dprintf("%s: returning REPARSE\n", __func__);
+				VN_RELE(dvp);
 				return STATUS_REPARSE;
 			}
 
@@ -422,16 +424,6 @@ int zfs_find_dvp_vp(zfsvfs_t *zfsvfs, char *filename, int finalpartmaynotexist, 
 		return EEXIST;
 	}
 
-#if 0
-	/* Test for deleted status */
-	if (vp != NULL && vnode_deleted(vp)) {
-		dprintf("%s: detected isdeleted, returning ENOENT\n", __func__);
-		VN_RELE(vp);
-		VN_RELE(dvp);
-		return ENOENT;
-	}
-#endif
-
 	// If finalpartmaynotexist is TRUE, make sure we are looking at
 	// the finalpart, and not in the middle of descending
 	if (finalpartmaynotexist && brkt != NULL && *brkt != 0) {
@@ -468,7 +460,7 @@ int zfs_find_dvp_vp(zfsvfs_t *zfsvfs, char *filename, int finalpartmaynotexist, 
  * and will assign FileObject->FsContext as appropriate, with usecount set
  * when required, but it will not hold iocount.
  */
-int zfs_vnop_lookup_impl(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo, char *filename)
+int zfs_vnop_lookup_impl(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo, char *filename, vattr_t *vap)
 {
 	int error;
 	cred_t *cr = NULL;
@@ -593,8 +585,7 @@ int zfs_vnop_lookup_impl(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo, char 
 		dvp = ZTOV(zp);
 		vnode_ref(dvp); // Hold open reference, until CLOSE
 
-		vnode_couplefileobject(dvp, FileObject);
-		IrpSp->FileObject->FsContext2 = zfs_dirlist_alloc();
+		zfs_couplefileobject(dvp, FileObject, 0ULL);
 		VN_RELE(dvp);
 
 		Irp->IoStatus.Information = FILE_OPENED;
@@ -634,12 +625,9 @@ int zfs_vnop_lookup_impl(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo, char 
 
 				if (error == 0) {
 					vp = ZTOV(zp);
-					vnode_couplefileobject(vp, FileObject);
+					zfs_couplefileobject(vp, FileObject, zp->z_size);
 					vnode_ref(vp); // Hold open reference, until CLOSE
 					VN_RELE(vp);
-
-					// A valid lookup gets a ccb attached
-					IrpSp->FileObject->FsContext2 = zfs_dirlist_alloc();
 
 					Irp->IoStatus.Information = FILE_OPENED;
 					return STATUS_SUCCESS;
@@ -672,9 +660,7 @@ int zfs_vnop_lookup_impl(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo, char 
 			// Grab vnode to ref
 			if (VN_HOLD(dvp) == 0) {
 				vnode_ref(dvp); // Hold open reference, until CLOSE
-				vnode_couplefileobject(dvp, FileObject);
-				if (vnode_isdir(dvp))
-					FileObject->FsContext2 = zfs_dirlist_alloc();
+				zfs_couplefileobject(dvp, FileObject, 0ULL);
 				VN_RELE(dvp);
 			} else {
 				Irp->IoStatus.Information = 0;
@@ -832,11 +818,10 @@ int zfs_vnop_lookup_impl(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo, char 
 #endif
 
 			dprintf("%s: opening PARENT directory\n", __func__);
-			IrpSp->FileObject->FsContext2 = zfs_dirlist_alloc();
-			vnode_couplefileobject(dvp, FileObject);
+			zfs_couplefileobject(dvp, FileObject, 0ULL);
 			vnode_ref(dvp); // Hold open reference, until CLOSE
 			if (DeleteOnClose) 
-				Status = zfs_setunlink(vp, dvp);
+				Status = zfs_setunlink(FileObject, dvp);
 
 			if (Status == STATUS_SUCCESS)
 				Irp->IoStatus.Information = FILE_OPENED;
@@ -869,7 +854,6 @@ int zfs_vnop_lookup_impl(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo, char 
 	}
 
 	if (CreateDirectory && finalname) {
-		vattr_t vap = { 0 };
 
 		if (TemporaryFile) 
 			return STATUS_INVALID_PARAMETER;
@@ -881,21 +865,21 @@ int zfs_vnop_lookup_impl(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo, char 
 			return STATUS_MEDIA_WRITE_PROTECTED;
 		}
 
-		vap.va_mask = AT_MODE | AT_TYPE ;
-		vap.va_type = VDIR;
-		vap.va_mode = 0755;
-		//VATTR_SET(&vap, va_mode, 0755);
+		vap->va_type = VDIR;
+		// Set default 777 if something else wasn't passed in
+		if (!(vap->va_mask & AT_MODE))
+			vap->va_mode = 0777;
+		vap->va_mask |= (AT_MODE | AT_TYPE);
+
 		ASSERT(strchr(finalname, '\\') == NULL);
-		error = zfs_mkdir(dvp, finalname, &vap, &vp, NULL,
+		error = zfs_mkdir(dvp, finalname, vap, &vp, NULL,
 			NULL, 0, NULL);
 		if (error == 0) {
 
-			// TODO: move creating zccb to own function
-			IrpSp->FileObject->FsContext2 = zfs_dirlist_alloc();
-			vnode_couplefileobject(vp, FileObject);
+			zfs_couplefileobject(vp, FileObject, 0ULL);
 			vnode_ref(vp); // Hold open reference, until CLOSE
 			if (DeleteOnClose)
-				Status = zfs_setunlink(vp, dvp);
+				Status = zfs_setunlink(FileObject, dvp);
 
 			if (Status == STATUS_SUCCESS) {
 				Irp->IoStatus.Information = FILE_CREATED;
@@ -1071,7 +1055,6 @@ int zfs_vnop_lookup_impl(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo, char 
 	}
 
 	if (CreateFile && finalname) {
-		vattr_t vap = { 0 };
 		int replacing = 0;
 
 		if (zfsvfs->z_rdonly || vfs_isrdonly(zfsvfs->z_vfs) ||
@@ -1090,37 +1073,37 @@ int zfs_vnop_lookup_impl(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo, char 
 			replacing = 1;
 		}
 
-		vap.va_mask = AT_MODE | AT_TYPE;
-		vap.va_type = VREG;
-		vap.va_mode = 0644;
+		vap->va_type = VREG;
+		if (!(vap->va_mask & AT_MODE))
+			vap->va_mode = 0777;
+		vap->va_mask = (AT_MODE | AT_TYPE);
 
 		// If O_TRUNC:
 		switch (CreateDisposition) {
 		case FILE_SUPERSEDE:
 		case FILE_OVERWRITE_IF:
 		case FILE_OVERWRITE:
-			vap.va_mask |= AT_SIZE;
-			vap.va_size = 0;
+			vap->va_mask |= AT_SIZE;
+			vap->va_size = 0;
 			break;
 		}
 
 		// O_EXCL only if FILE_CREATE
-		error = zfs_create(dvp, finalname, &vap, CreateDisposition == FILE_CREATE, vap.va_mode, &vp, NULL);
+		error = zfs_create(dvp, finalname, vap, CreateDisposition == FILE_CREATE, vap->va_mode, &vp, NULL);
 		if (error == 0) {
-			vnode_couplefileobject(vp, FileObject);
+
+			zp = VTOZ(vp);
+
+			zfs_couplefileobject(vp, FileObject, zp?zp->z_size:0ULL);
 			vnode_ref(vp); // Hold open reference, until CLOSE
 
 			if (DeleteOnClose) 
-				Status = zfs_setunlink(vp, dvp);
+				Status = zfs_setunlink(FileObject, dvp);
 
 			if (Status == STATUS_SUCCESS) {
 
-				FileObject->SectionObjectPointer = vnode_sectionpointer(vp);
-
 				Irp->IoStatus.Information = replacing ? CreateDisposition == FILE_SUPERSEDE ?
 					FILE_SUPERSEDED : FILE_OVERWRITTEN : FILE_CREATED;
-
-				zp = VTOZ(vp);
 
 				// Update pflags, if needed
 				zfs_setwinflags(zp, IrpSp->Parameters.Create.FileAttributes | FILE_ATTRIBUTE_ARCHIVE);
@@ -1167,11 +1150,10 @@ int zfs_vnop_lookup_impl(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo, char 
 	// Just open it, if the open was to a directory, add ccb
 	ASSERT(IrpSp->FileObject->FsContext == NULL);
 	if (vp == NULL) {
-		IrpSp->FileObject->FsContext2 = zfs_dirlist_alloc();
-		vnode_couplefileobject(dvp, FileObject);
+		zfs_couplefileobject(dvp, FileObject, 0ULL);
 		vnode_ref(dvp); // Hold open reference, until CLOSE
 		if (DeleteOnClose) 
-			Status = zfs_setunlink(vp, dvp);
+			Status = zfs_setunlink(FileObject, dvp);
 
 		if(Status == STATUS_SUCCESS) {
 			if (UndoShareAccess == FALSE) {
@@ -1188,14 +1170,12 @@ int zfs_vnop_lookup_impl(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo, char 
 		VN_RELE(dvp);
 	} else {
 		// Technically, this should call zfs_open() - but it is mostly empty
-		vnode_couplefileobject(vp, FileObject);
+		zfs_couplefileobject(vp, FileObject, zp->z_size);
 		vnode_ref(vp); // Hold open reference, until CLOSE
 		if (DeleteOnClose)
-			Status = zfs_setunlink(vp, dvp);
+			Status = zfs_setunlink(FileObject, dvp);
 
 		if(Status == STATUS_SUCCESS) {
-
-			FileObject->SectionObjectPointer = vnode_sectionpointer(vp);
 
 			Irp->IoStatus.Information = FILE_OPENED;
 			// Did they set the open flags (clearing archive?)
@@ -1243,11 +1223,24 @@ int zfs_vnop_lookup(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo)
 {
 	int status;
 	char *filename = NULL;
+	vattr_t vap = { 0 };
+
+	// Check the EA buffer is good, if supplied.
+	if (Irp->AssociatedIrp.SystemBuffer != NULL &&
+		IrpSp->Parameters.Create.EaLength > 0) {
+		ULONG offset;
+		status = IoCheckEaBufferValidity(Irp->AssociatedIrp.SystemBuffer, IrpSp->Parameters.Create.EaLength, &offset);
+		if (!NT_SUCCESS(status)) {
+			dprintf("IoCheckEaBufferValidity returned %08x (error at offset %u)\n", status, offset);
+			return status;
+		}
+	}
 
 	// Allocate space to hold name, must be freed from here on
 	filename = kmem_alloc(PATH_MAX, KM_SLEEP);
 
-#ifdef QUERY_ON_CREATE_ECP_CONTEXT 
+	// Deal with ExtraCreateParameters
+#if defined (NTDDI_WIN10_RS5) && (NTDDI_VERSION >= NTDDI_WIN10_RS5)
 	/* Check for ExtraCreateParameters */
 	PECP_LIST ecp = NULL;
 	PQUERY_ON_CREATE_ECP_CONTEXT qocContext = NULL;
@@ -1263,7 +1256,7 @@ int zfs_vnop_lookup(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo)
 				// More code to come here:
 			} else if (IsEqualGUID(&ecpType, &GUID_ECP_QUERY_ON_CREATE)) {
 				dprintf("GUID_ECP_QUERY_ON_CREATE\n");
-				// It wants a getattr call on success
+				// It wants a getattr call on success, before we finish up
 				qocContext = (PQUERY_ON_CREATE_ECP_CONTEXT)ecpContext;
 			} else if (IsEqualGUID(&ecpType, &GUID_ECP_CREATE_REDIRECTION)) {
 				dprintf("GUID_ECP_CREATE_REDIRECTION\n");
@@ -1275,23 +1268,83 @@ int zfs_vnop_lookup(PIRP Irp, PIO_STACK_LOCATION IrpSp, mount_t *zmo)
 	} // if ecp
 #endif
 
-	status = zfs_vnop_lookup_impl(Irp, IrpSp, zmo, filename);
+	// The associated buffer on a CreateFile is an EA buffer.
+	// Already Verified above - do a quickscan of any EAs we
+	// handle in a special way, before we call zfs_vnop_lookup_impl().
+	// We handle the regular EAs afterward.
+	if (Irp->AssociatedIrp.SystemBuffer != NULL &&
+		IrpSp->Parameters.Create.EaLength > 0) {
 
-#ifdef QUERY_ON_CREATE_ECP_CONTEXT 
+		for (PFILE_FULL_EA_INFORMATION ea = (PFILE_FULL_EA_INFORMATION)Irp->AssociatedIrp.SystemBuffer; 
+			; 
+			ea = (PFILE_FULL_EA_INFORMATION)((uint8_t*)ea + ea->NextEntryOffset)) {
+			// only parse $LX attrs right now -- things we can store before the file
+			// gets created.
+			if (vattr_apply_lx_ea(&vap, ea)) {
+				dprintf("  encountered special attrs EA '%.*s'\n", ea->EaNameLength, ea->EaName);
+			}
+			if (ea->NextEntryOffset == 0)
+				break;
+		}
+	}
+
+
+
+	// Call ZFS
+	status = zfs_vnop_lookup_impl(Irp, IrpSp, zmo, filename, &vap);
+
+
+
+#if defined (NTDDI_WIN10_RS5) && (NTDDI_VERSION >= NTDDI_WIN10_RS5)
 	// Did ECP ask for getattr to be returned? None, one or both can be set.
 	// This requires vnode_couplefileobject() was called
 	if (NT_SUCCESS(status) && qocContext && IrpSp->FileObject->FsContext) {
-		if (BooleanFlagOn(qocContext->Flags, QoCFileStatInformation)) {
+
+		ULONG classes = 0;
+
+		// Handle RS5 >= version < 19H1 when the struct had "Flags".
+#if defined (NTDDI_WIN10_19H1) && (NTDDI_VERSION >= NTDDI_WIN10_19H1)
+		classes = qocContext->RequestedClasses;
+#else
+		classes = qocContext->Flags;
+#endif
+
+		if (BooleanFlagOn(classes, QoCFileStatInformation)) {
 			file_stat_information(IrpSp->DeviceObject, Irp, IrpSp,
 				&qocContext->StatInformation);
 		}
-		if (BooleanFlagOn(qocContext->Flags, QoCFileLxInformation)) {
+		if (BooleanFlagOn(classes, QoCFileLxInformation)) {
 			file_stat_lx_information(IrpSp->DeviceObject, Irp, IrpSp,
 				&qocContext->LxInformation);
 		}
+		if (BooleanFlagOn(classes, QoCFileEaInformation)) {
+			dprintf("%s: unsupported QoC: QoCFileEaInformation\n");
+		}
+#if defined (NTDDI_WIN10_19H1) && (NTDDI_VERSION >= NTDDI_WIN10_19H1)
+		// We should fill this in, right? Only set those we understand.
+		qocContext->ClassesProcessed = classes & (QoCFileStatInformation|QoCFileLxInformation);
+		qocContext->ClassesWithErrors = 0;
+		qocContext->ClassesWithNoData = 0;
+#endif
+
 		FsRtlAcknowledgeEcp(qocContext);
 	}
 #endif
+
+	// Now handle proper EAs properly
+	if (NT_SUCCESS(status)) {
+		if (Irp->AssociatedIrp.SystemBuffer &&
+			IrpSp->FileObject->FsContext) {
+			// Second pass: this will apply all EAs that are not only LX EAs
+			vnode_apply_eas(IrpSp->FileObject->FsContext,
+				(PFILE_FULL_EA_INFORMATION)Irp->AssociatedIrp.SystemBuffer,
+				IrpSp->Parameters.Create.EaLength, NULL);
+		}
+
+		if (!BooleanFlagOn(IrpSp->Parameters.Create.Options, FILE_NO_INTERMEDIATE_BUFFERING)) {
+			IrpSp->FileObject->Flags |= FO_CACHE_SUPPORTED;
+		}
+	}
 
 	// Free filename
 	kmem_free(filename, PATH_MAX);
@@ -1543,7 +1596,9 @@ NTSTATUS query_volume_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STA
 			break;
 		}
 
-#define ZFS_FS_ATTRIBUTE_POSIX
+/* Do not enable until we have implemented FileRenameInformationEx method. */
+//#define ZFS_FS_ATTRIBUTE_POSIX
+
 #define ZFS_FS_ATTRIBUTE_CLEANUP_INFO
 
 		FILE_FS_ATTRIBUTE_INFORMATION *ffai = Irp->AssociatedIrp.SystemBuffer;
@@ -2096,8 +2151,6 @@ NTSTATUS query_ea(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpS
 
 	uint64_t start_index = 0;
 
-	// Attach a directory zccb to the file we are to EA list
-	if (IrpSp->FileObject->FsContext2 == NULL) IrpSp->FileObject->FsContext2 = zfs_dirlist_alloc();
 	zfs_dirlist_t *zccb = IrpSp->FileObject->FsContext2;
 
 	if (RestartScan)
@@ -2178,46 +2231,6 @@ out:
 	return Status;
 }
 
-int xattr_process(struct vnode *vp, struct vnode *xdvp, FILE_FULL_EA_INFORMATION *ea)
-{
-	int error;
-	struct vnode *xvp = NULL;
-
-	dprintf("%s: xattr '%.*s' valuelen %u\n", __func__,
-		ea->EaNameLength, ea->EaName, ea->EaValueLength);
-
-	if (ea->EaValueLength == 0) {
-
-		// Remove EA
-		error = zfs_remove(xdvp, ea->EaName, NULL, NULL, /* flags */0);
-
-	} else {
-		// Add replace EA
-
-		error = zfs_obtain_xattr(VTOZ(xdvp), ea->EaName, VTOZ(vp)->z_mode, NULL,
-			&xvp, 0);
-		if (error)
-			goto out;
-
-		/* Truncate, if it was existing */
-		error = zfs_freesp(VTOZ(xvp), 0, 0, VTOZ(vp)->z_mode, TRUE);
-
-		/* Write data */
-		uio_t *uio;
-		uio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
-		uio_addiov(uio, (user_addr_t)ea->EaName + ea->EaNameLength + 1, 
-			ea->EaValueLength);
-		error = zfs_write(xvp, uio, 0, NULL, NULL);
-		uio_free(uio);
-	}
-
-out:
-	if (xvp != NULL)
-		VN_RELE(xvp);
-
-	return error;
-}
-
 /*
  * Receive an array of structs to set EAs, iterate until Next is null.
  */
@@ -2227,6 +2240,7 @@ NTSTATUS set_ea(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
 	uint8_t *buffer = NULL, *UserBuffer = NULL;
 	NTSTATUS Status = STATUS_SUCCESS;
 	struct vnode *vp = NULL, *xdvp = NULL;
+	vattr_t vap = { 0 };
 
 	if (IrpSp->FileObject == NULL) return STATUS_INVALID_PARAMETER;
 
@@ -2242,44 +2256,13 @@ NTSTATUS set_ea(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
 	// This magic is straight out of fastfat
 	buffer = BufferUserBuffer(Irp, input_len);
 
-	Status = IoCheckEaBufferValidity((PFILE_FULL_EA_INFORMATION)buffer,
-		input_len,
-		(PULONG)&Irp->IoStatus.Information);
-
+	ULONG eaErrorOffset = 0;
+	Status = vnode_apply_eas(vp, (PFILE_FULL_EA_INFORMATION)buffer, input_len, &eaErrorOffset);
+	// (Information is ULONG_PTR; as win64 is a LLP64 platform, ULONG isn't the right length.)
+	Irp->IoStatus.Information = eaErrorOffset;
 	if (!NT_SUCCESS(Status)) {
-		dprintf("%s: failed Validity: 0x%x\n", __func__, Status);
+		dprintf("%s: failed vnode_apply_eas: 0x%x\n", __func__, Status);
 		return Status;
-	}
-
-	// Iterate "buffer", to get xattr name, and value.
-	FILE_FULL_EA_INFORMATION *FullEa;
-	
-	// Open (or Create) the xattr directory
-	if (zfs_get_xattrdir(VTOZ(vp), &xdvp, NULL, CREATE_XATTR_DIR) != 0) {
-		Status = STATUS_EA_CORRUPT_ERROR;
-		goto out;
-	}
-
-	uint64_t offset = 0;
-	int error;
-	do {
-		FullEa = (FILE_FULL_EA_INFORMATION *)&buffer[offset];
-
-		error = xattr_process(vp, xdvp, FullEa);
-		if (error != 0) dprintf("  failed to process xattr: %d\n", error);
-
-		offset = FullEa->NextEntryOffset;
-	} while (offset != 0);
-
-out:
-	if (NT_SUCCESS(Status)) {
-		zfs_send_notify(zp->z_zfsvfs, zp->z_name_cache, zp->z_name_offset,
-			FILE_NOTIFY_CHANGE_EA,
-			FILE_ACTION_MODIFIED);
-	}
-
-	if (xdvp != NULL) {
-		VN_RELE(xdvp);
 	}
 
 	return Status;
@@ -2748,6 +2731,7 @@ NTSTATUS notify_change_directory(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STAC
 	}
 
 	struct vnode *vp = fileObject->FsContext;
+	zfs_dirlist_t *zccb = fileObject->FsContext2;
 	ASSERT(vp != NULL);
 
 	VN_HOLD(vp);
@@ -2758,7 +2742,7 @@ NTSTATUS notify_change_directory(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STAC
 		return STATUS_INVALID_PARAMETER;
 	}
 
-	if (vnode_deleteonclose(vp)) {
+	if (zccb && zccb->deleteonclose) {
 		VN_RELE(vp);
 		return STATUS_DELETE_PENDING;
 	}
@@ -2861,6 +2845,8 @@ NTSTATUS set_information(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATI
 	case FileDispositionInformationEx:
 		Status = file_disposition_information_ex(DeviceObject, Irp, IrpSp);
 		break;
+	//case FileRenameInformationEx:
+	//	break;
 	default:
 		dprintf("* %s: unknown type NOTIMPLEMENTED\n", __func__);
 		break;
@@ -2955,16 +2941,13 @@ NTSTATUS fs_read(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp
 		releaselock = 1;
 	} 
 
-	if (fileObject->SectionObjectPointer == NULL)
-		fileObject->SectionObjectPointer = vnode_sectionpointer(vp);
-
-
 	void *SystemBuffer = MapUserBuffer(Irp);
 
 	if (nocache) {
 
 	} else {
 		// Cached
+#if 1
 		if (fileObject->PrivateCacheMap == NULL) {
 			CC_FILE_SIZES ccfs;
 			vp->FileHeader.FileSize.QuadPart = zp->z_size;
@@ -2977,9 +2960,18 @@ NTSTATUS fs_read(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp
 			CcSetAdditionalCacheAttributes(fileObject, TRUE, TRUE); // FIXME: for now
 			dprintf("%s: CcInitializeCacheMap\n", __func__);
 		}
+#endif
 
 		// DO A NORMAL CACHED READ, if the MDL bit is not set,
 		if (!FlagOn(IrpSp->MinorFunction, IRP_MN_MDL)) {
+
+			// Sometimes, the CcMgr has not been set up?
+			if (zp->z_size != vp->FileHeader.FileSize.QuadPart) {
+				vnode_pager_setsize(vp, zp->z_size);
+				CcSetFileSizes(IrpSp->FileObject, (PCC_FILE_SIZES)&vp->FileHeader.AllocationSize);
+				dprintf("read: size not set, now %llx\n", vp->FileHeader.FileSize);
+				vnode_setsizechange(vp, 0);
+			}
 
 #if (NTDDI_VERSION >= NTDDI_WIN8)
 			if (!CcCopyReadEx(fileObject,
@@ -3130,17 +3122,12 @@ NTSTATUS fs_write(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpS
 
 		//ASSERT(fileObject->PrivateCacheMap != NULL);
 	}
-
-	if (fileObject->SectionObjectPointer == NULL)
-		fileObject->SectionObjectPointer = vnode_sectionpointer(vp);
-
-
+	
 	if (!nocache && !CcCanIWrite(fileObject, bufferLength, TRUE, FALSE)) {
 		Status = STATUS_PENDING;
 		DbgBreakPoint();
 		goto out;
 	}
-
 
 	if (nocache && !pagingio && fileObject->SectionObjectPointer &&
 		fileObject->SectionObjectPointer->DataSectionObject) {
@@ -3165,20 +3152,15 @@ NTSTATUS fs_write(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpS
 	if (!nocache) {
 
 		if (fileObject->PrivateCacheMap == NULL) {
-
 			vnode_pager_setsize(vp, zp->z_size);
 			vnode_setsizechange(vp, 0);
-			CcInitializeCacheMap(fileObject, 
+			CcInitializeCacheMap(fileObject,
 				(PCC_FILE_SIZES)&vp->FileHeader.AllocationSize, FALSE,
 				&CacheManagerCallbacks, vp);
-
 			CcSetAdditionalCacheAttributes(fileObject, TRUE, TRUE); // FIXME: for now
-
 			dprintf("%s: CcInitializeCacheMap\n", __func__);
-
 			//CcSetReadAheadGranularity(fileObject, READ_AHEAD_GRANULARITY);
 		}
-		
 
 		// If beyond valid data, zero between to expand (this is cachedfile, not paging io, extend ok)
 		if (byteOffset.QuadPart + bufferLength > zp->z_size) {
@@ -3200,13 +3182,17 @@ NTSTATUS fs_write(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpS
 			// the actual writes will come later (from CcMgr).
 			dprintf("%s: growing file\n", __func__);
 
+			// Don't call zfs_freesp() here, to extend the file, as the file (and size) is
+			// synced to disk, so if we crash, the file has lots of zeros at the end.
+			// We only tell CcMgr it is larger, and let ZFS file grow with (future) writes.
+			vnode_pager_setsize(vp, byteOffset.QuadPart + bufferLength);
 			// zfs_freesp() calls vnode_pager_setsize();
-			Status = zfs_freesp(zp,
-				byteOffset.QuadPart,  bufferLength,
-				FWRITE, B_TRUE);
-			ASSERT0(Status);
+			//Status = zfs_freesp(zp,
+			//	byteOffset.QuadPart,  bufferLength,
+			//	FWRITE, B_TRUE);
+			//ASSERT0(Status);
 			// Confirm size grown
-			ASSERT(byteOffset.QuadPart + bufferLength == zp->z_size);
+//			ASSERT(byteOffset.QuadPart + bufferLength == zp->z_size);
 		} else {
 			//vnode_pager_setsize(vp, zp->z_size);
 		}
@@ -3380,14 +3366,14 @@ NTSTATUS delete_entry(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION 
 		
 		error = zfs_rmdir(dvp, finalname, NULL, NULL, NULL, 0);
 
-		if (error == ENOTEMPTY)
-			error = STATUS_DIRECTORY_NOT_EMPTY;
-
 	} else {
 
 		error = zfs_remove(dvp, finalname, NULL, NULL, 0);
 
 	}
+
+	if (error == ENOTEMPTY)
+		error = STATUS_DIRECTORY_NOT_EMPTY;
 
 	// Release parent.
 	VN_RELE(dvp);
@@ -3615,15 +3601,16 @@ NTSTATUS volume_close(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION 
  * IRP_MJ_CLEANUP - sent when Windows is done with FileObject HANDLE (one of many)
  *     the vp is not released here, just decrease a count of vp.
  */
-int zfs_fileobject_cleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
+int zfs_fileobject_cleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp,
+	vnode_t **hold_vp)
 {
 	int Status = STATUS_SUCCESS;
 	mount_t *zmo = NULL;
 
 	if (IrpSp->FileObject && IrpSp->FileObject->FsContext) {
 		struct vnode *vp = IrpSp->FileObject->FsContext;
+		zfs_dirlist_t *zccb = IrpSp->FileObject->FsContext2;
 
-		VN_HOLD(vp);
 		znode_t *zp = VTOZ(vp); // zp for notify removal
 		zfsvfs_t *zfsvfs = zp->z_zfsvfs;
 
@@ -3648,10 +3635,18 @@ int zfs_fileobject_cleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCA
 		 * in the ccb (context) set in FsContext2, which holds data for each
 		 * FileObject context. Possibly, we should as well. (We do for dirs)
 		 */
-		if (vnode_deleteonclose(vp)) {
+		if (zccb && zccb->deleteonclose) {
 
-			// Mark it as deleted, zfs_vnop_lookup() will return error now.
-			vnode_setdeleted(vp);
+			// Windows needs us to unlink it now, since CLOSE can be delayed
+			// and parent deletions might fail (ENOTEMPTY).
+			Status = delete_entry(DeviceObject, Irp, IrpSp);
+			if (Status != 0)
+				dprintf("Deletion failed: %d\n", Status);
+
+			// delete_entry will always consume an IOCOUNT.
+			*hold_vp = NULL;
+
+			Status = STATUS_SUCCESS;
 
 			// FILE_CLEANUP_UNKNOWN FILE_CLEANUP_WRONG_DEVICE FILE_CLEANUP_FILE_REMAINS
 			// FILE_CLEANUP_FILE_DELETED FILE_CLEANUP_LINK_DELETED FILE_CLEANUP_STREAM_DELETED
@@ -3689,7 +3684,6 @@ int zfs_fileobject_cleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCA
 
 		SetFlag(IrpSp->FileObject->Flags, FO_CLEANUP_COMPLETE);
 
-		VN_RELE(vp);
 		Status = STATUS_SUCCESS;
 	}
 
@@ -3710,11 +3704,6 @@ int zfs_fileobject_close(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATI
 
 		dprintf("IRP_MJ_CLOSE: '%wZ' \n", &IrpSp->FileObject->FileName);
 
-		if (IrpSp->FileObject->FsContext2) {
-			zfs_dirlist_free((zfs_dirlist_t *)IrpSp->FileObject->FsContext2);
-			IrpSp->FileObject->FsContext2 = NULL;
-		}
-
 		if (IrpSp->FileObject->FsContext) {
 			dprintf("CLOSE clearing FsContext of FO 0x%llx\n", IrpSp->FileObject);
 			// Mark vnode for cleanup, we grab a HOLD to make sure it isn't
@@ -3726,55 +3715,12 @@ int zfs_fileobject_close(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATI
 			 * First encourage Windows to release the FileObject, CcMgr etc, flush everything.
 			 */
 
-			if (!vnode_isinuse(vp, 0)) {
+			// FileObject should/could no longer point to vp.
+			zfs_decouplefileobject(vp, IrpSp->FileObject);
+			vnode_fileobject_remove(vp, IrpSp->FileObject);
 
-				SECTION_OBJECT_POINTERS *section;
-				section = vnode_sectionpointer(vp);
-
-				if (IrpSp->FileObject->SectionObjectPointer)
-					ASSERT(IrpSp->FileObject->SectionObjectPointer == section);
-
-				// ImageSection has to be first
-				if (section->ImageSectionObject) {
-					(VOID)MmFlushImageSection(section, MmFlushForWrite);
-				}
-
-				// DataSection next
-				if (FlagOn(IrpSp->FileObject->Flags, FO_CACHE_SUPPORTED) &&
-					section && section->DataSectionObject) {
-					IO_STATUS_BLOCK iosb;
-					CcFlushCache(section, NULL, 0, &iosb);
-
-					CcPurgeCacheSection(section, NULL, 0, FALSE);
-				}
-
-				// Finally force out CCMap
-				if (IrpSp->FileObject->SectionObjectPointer) {
-					LARGE_INTEGER Zero = { 0,0 };
-					CACHE_UNINITIALIZE_EVENT UninitializeCompleteEvent;
-					NTSTATUS WaitStatus;
-					KeInitializeEvent(&UninitializeCompleteEvent.Event,
-						SynchronizationEvent,
-						FALSE);
-					// Because CcUninitializeCacheMap() can call MJ_CLOSE immediately, and we
-					// don't want to free anything in *that* call, take a usecount++ here.
-					vnode_ref(vp);
-					CcUninitializeCacheMap(IrpSp->FileObject, vnode_deleted(vp) ? &Zero : NULL, &UninitializeCompleteEvent);
-					WaitStatus = KeWaitForSingleObject(&UninitializeCompleteEvent.Event,
-						Executive,
-						KernelMode,
-						FALSE,
-						NULL);
-					vnode_rele(vp);
-					ASSERT(WaitStatus == STATUS_SUCCESS);
-				}
-			}
-
-
-			// Remove this FO from vp. If we are empty, we can remove memory
-			vnode_fileobject_remove(IrpSp->FileObject->FsContext, IrpSp->FileObject);
-
-			/* If we can release now, do so.
+			/* 
+			 * If we can release now, do so.
 			 * If the reference count for the per-file context structure reaches zero
 			 * and both the ImageSectionObject and DataSectionObject of the SectionObjectPointers
 			 * field from the FILE_OBJECT is zero, the filter driver may then delete the per-file context data.
@@ -3783,44 +3729,24 @@ int zfs_fileobject_close(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATI
 
 			if (!vnode_isvroot(vp)) {
 
-				/* Take hold from above, we will release in recycle */
+				/* Take hold from dispatcher, we will try to release in recycle */
 				*hold_vp = NULL;
 
-				/* We can free memory, check if we also should delete file */
-				if (vnode_deleted(vp)) {
-
-					atomic_inc_64(&delete_pending);
-
-					/*
-					 * This call to delete_entry may release the vp/zp in one case
-					 * So care needs to be taken. Most branches the vp/zp lives with
-					 * zero iocount, ready to be reused.
-					 * delete_entry() requires iocount to be held.
-					 * Access to "vp" may be invalid after this call, so it should be
-					 * last.
-					 */
-					dprintf("delete vnode %p\n", vp);
-					Status = delete_entry(DeviceObject, Irp, IrpSp);
-
-					atomic_dec_64(&delete_pending);
-
-				} else { /* If vp is not deleted */
-
-					// Release vp - vnode_recycle expects iocount==1
-					// we don't recycle root (unmount does) or RELE on recycle error
-					if (vnode_isvroot(vp) || (vnode_recycle(vp) != 0)) {
-						VN_RELE(vp);
-					}
-
-					Status = STATUS_SUCCESS;
+				// Release vp - vnode_recycle expects iocount==1
+				// we don't recycle root (unmount does) or RELE on recycle error
+				if (vnode_isvroot(vp) || (vnode_recycle(vp) != 0)) {
+					// If recycle failed, manually release dispatcher's HOLD
+					dprintf("IRP_CLOSE failed to recycle. is_empty %d\n", vnode_fileobject_empty(vp, 1));
+					VN_RELE(vp);
 				}
+
+				Status = STATUS_SUCCESS;
+
 				vp = NULL; // Paranoia, signal it is gone.
 
-			} else { /* if vp is not idle */
-				dprintf("IRP_CLOSE but can't close yet. is_empty %d\n", vnode_fileobject_empty(vp, 1));
+			} else { /* root node */
 				Status = STATUS_SUCCESS;
 			}
-			IrpSp->FileObject->FsContext = NULL;
 		}
 	}
 
@@ -4443,17 +4369,6 @@ fsDispatcher(
 
 			Status = zfs_vnop_lookup(Irp, IrpSp, zmo);
 
-			// If we claimed to have opened a file, vp should be set
-			if (Status == 0) {
-
-				ASSERT(IrpSp->FileObject != NULL);
-
-				// Record all FO used with vp, starting with this one
-				if (IrpSp->FileObject && IrpSp->FileObject->FsContext)
-					vnode_fileobject_add(IrpSp->FileObject->FsContext, IrpSp->FileObject);
-
-			}
-
 			if (Status == EROFS)
 				Status = STATUS_MEDIA_WRITE_PROTECTED;
 		}
@@ -4474,7 +4389,7 @@ fsDispatcher(
 		 * CLOSE.
 		 */
 	case IRP_MJ_CLEANUP: 
-		Status = zfs_fileobject_cleanup(DeviceObject, Irp, IrpSp);
+		Status = zfs_fileobject_cleanup(DeviceObject, Irp, IrpSp, &hold_vp);
 		break;
 
 	case IRP_MJ_CLOSE:
@@ -4569,6 +4484,10 @@ fsDispatcher(
 			dprintf("IOCTL_STORAGE_GET_DEVICE_NUMBER\n");
 			Status = ioctl_storage_get_device_number(DeviceObject, Irp, IrpSp);
 			break;
+		case IOCTL_STORAGE_QUERY_PROPERTY:
+			dprintf("IOCTL_STORAGE_QUERY_PROPERTY\n");
+			Status = ioctl_storage_query_property(DeviceObject, Irp, IrpSp);
+			break;
 		default:
 			dprintf("**** unknown fsWindows IOCTL: 0x%lx\n", cmd);
 		}
@@ -4585,8 +4504,13 @@ fsDispatcher(
 		case IRP_MN_USER_FS_REQUEST:
 			Status = user_fs_request(DeviceObject, Irp, IrpSp);
 			break;
+		case IRP_MN_KERNEL_CALL: // FSCTL_QUERY_VOLUME_CONTAINER_STATE 0x90930
+			dprintf("IRP_MN_KERNEL_CALL: unknown 0x%x\n", IrpSp->Parameters.FileSystemControl.FsControlCode);
+			Status = STATUS_INVALID_DEVICE_REQUEST;
+			break;
 		default:
 			dprintf("IRP_MJ_FILE_SYSTEM_CONTROL: unknown 0x%x\n", IrpSp->MinorFunction);
+			Status = STATUS_INVALID_DEVICE_REQUEST;
 		}
 		break;
 
@@ -4700,7 +4624,6 @@ fsDispatcher(
 		break;
 	}
 
-
 	/* Re-check (since MJ_CREATE/vnop_lookup might have set it) vp here, to see if
 	 * we should call setsize 
 	 */
@@ -4753,8 +4676,9 @@ dispatcher(
 )
 {
 	BOOLEAN TopLevel = FALSE;
+	BOOLEAN AtIrqlPassiveLevel;
 	PIO_STACK_LOCATION IrpSp;
-	NTSTATUS Status;
+	NTSTATUS Status = STATUS_NOT_IMPLEMENTED;
 	uint64_t validity_check;
 
 	// Storport can call itself (and hence, ourselves) so this isn't always true.
@@ -4774,75 +4698,81 @@ dispatcher(
 	}
 #endif
 	validity_check = *((uint64_t *)Irp);
+	IrpSp = IoGetCurrentIrpStackLocation(Irp);
 
-	FsRtlEnterFileSystem();
+	dprintf("%s: enter: major %d: minor %d: %s: type 0x%x\n", __func__, IrpSp->MajorFunction, IrpSp->MinorFunction,
+		major2str(IrpSp->MajorFunction, IrpSp->MinorFunction), Irp->Type);
 
+	AtIrqlPassiveLevel = (KeGetCurrentIrql() == PASSIVE_LEVEL);
+	if (AtIrqlPassiveLevel) {
+		FsRtlEnterFileSystem();
+	}
 	if (IoGetTopLevelIrp() == NULL) {
 		IoSetTopLevelIrp(Irp);
 		TopLevel = TRUE;
 	}
 
-	IrpSp = IoGetCurrentIrpStackLocation(Irp);
-
-
-	dprintf("%s: enter: major %d: minor %d: %s: type 0x%x\n", __func__, IrpSp->MajorFunction, IrpSp->MinorFunction,
-		major2str(IrpSp->MajorFunction, IrpSp->MinorFunction), Irp->Type);
-
-	Status = STATUS_NOT_IMPLEMENTED;
-
 	if (DeviceObject == ioctlDeviceObject)
 		Status = ioctlDispatcher(DeviceObject, Irp, IrpSp);
 	else {
-		mount_t *zmo = DeviceObject->DeviceExtension;
+		mount_t * zmo = DeviceObject->DeviceExtension;
 		if (zmo && zmo->type == MOUNT_TYPE_DCB)
 			Status = diskDispatcher(DeviceObject, Irp, IrpSp);
 		else if (zmo && zmo->type == MOUNT_TYPE_VCB)
 			Status = fsDispatcher(DeviceObject, Irp, IrpSp);
 		else {
-
-			extern PDRIVER_UNLOAD STOR_DriverUnload;
 			extern PDRIVER_DISPATCH STOR_MajorFunction[IRP_MJ_MAXIMUM_FUNCTION + 1];
 			if (STOR_MajorFunction[IrpSp->MajorFunction] != NULL) {
-				if (TopLevel) { IoSetTopLevelIrp(NULL); }
-				FsRtlExitFileSystem();
+				if (TopLevel) {
+					IoSetTopLevelIrp(NULL);
+				}
+				if (AtIrqlPassiveLevel) {
+					FsRtlExitFileSystem();
+				}
 				//dprintf("Relaying IRP to STORport\n");
 				return STOR_MajorFunction[IrpSp->MajorFunction](DeviceObject, Irp);
 			}
+
 			// Got a request we don't care about?
 			Status = STATUS_INVALID_DEVICE_REQUEST;
 			Irp->IoStatus.Information = 0;
 		}
 	}
 
-
-	ASSERT(validity_check == *((uint64_t *)Irp));
-
-	// IOCTL_STORAGE_GET_HOTPLUG_INFO
-	// IOCTL_DISK_CHECK_VERIFY
-	//IOCTL_STORAGE_QUERY_PROPERTY
-	Irp->IoStatus.Status = Status;
-
-	if (TopLevel) { IoSetTopLevelIrp(NULL); }
-	FsRtlExitFileSystem();
+	if (AtIrqlPassiveLevel) {
+		FsRtlExitFileSystem();
+	}
+	if (TopLevel) {
+		IoSetTopLevelIrp(NULL);
+	}
 
 	switch (Status) {
 	case STATUS_SUCCESS:
 	case STATUS_BUFFER_OVERFLOW:
+	case STATUS_PENDING:
 		break;
 	default:
+		ASSERT(validity_check == *((uint64_t *)Irp));
 		dprintf("%s: exit: 0x%x %s Information 0x%x : %s\n", __func__, Status,
 			common_status_str(Status),
 			Irp->IoStatus.Information, major2str(IrpSp->MajorFunction, IrpSp->MinorFunction));
 	}
 
 	// Complete the request if it isn't pending (ie, we called zfsdev_async())
-	ASSERT(validity_check == *((uint64_t *)Irp));
-
 	if (Status != STATUS_PENDING)
-		IoCompleteRequest(Irp, Status == STATUS_SUCCESS ? IO_DISK_INCREMENT : IO_NO_INCREMENT);
+	{
+		if (validity_check == *((uint64_t *)Irp)) {
+			// IOCTL_STORAGE_GET_HOTPLUG_INFO
+			// IOCTL_DISK_CHECK_VERIFY
+			// IOCTL_STORAGE_QUERY_PROPERTY
+			Irp->IoStatus.Status = Status;
+			IoCompleteRequest(Irp, Status == STATUS_SUCCESS ? IO_DISK_INCREMENT : IO_NO_INCREMENT);
+		}
+		else
+			KeBugCheckEx(INCONSISTENT_IRP, (ULONG_PTR)Irp, 0, 0, 0);
+	}
 	return Status;
 }
-
 
 NTSTATUS ZFSCallbackAcquireForCreateSection(
 	IN PFS_FILTER_CALLBACK_DATA CallbackData,
@@ -4876,31 +4806,29 @@ are any writers to this file.  Note that main is acquired, so new handles cannot
 	ASSERT(vp != NULL);
 	if (vp == NULL) return STATUS_INVALID_PARAMETER;
 
-	if (vp->FileHeader.Resource) {
 #ifdef DEBUG_IOCOUNT
-		int nolock = 0;
-		if (mutex_owned(&GIANT_SERIAL_LOCK))
-			nolock = 1;
-		else
-			mutex_enter(&GIANT_SERIAL_LOCK);
+	int nolock = 0;
+	if (mutex_owned(&GIANT_SERIAL_LOCK))
+		nolock = 1;
+	else
+		mutex_enter(&GIANT_SERIAL_LOCK);
 #endif
-		if (VN_HOLD(vp) == 0) {
-			dprintf("%s: locked\n", __func__);
-			ExAcquireResourceExclusiveLite(vp->FileHeader.Resource, TRUE);
-			vnode_ref(vp);
-			VN_RELE(vp);
-		} else {
-#ifdef DEBUG_IOCOUNT
-			if (!nolock)
-				mutex_exit(&GIANT_SERIAL_LOCK);
-#endif
-			return STATUS_INVALID_PARAMETER;
-		}
+	if (VN_HOLD(vp) == 0) {
+		dprintf("%s: locked: %p\n", __func__, vp->FileHeader.Resource);
+		ExAcquireResourceExclusiveLite(vp->FileHeader.Resource, TRUE);
+		vnode_ref(vp);
+		VN_RELE(vp);
+	} else {
 #ifdef DEBUG_IOCOUNT
 		if (!nolock)
 			mutex_exit(&GIANT_SERIAL_LOCK);
 #endif
+		return STATUS_INVALID_PARAMETER;
 	}
+#ifdef DEBUG_IOCOUNT
+	if (!nolock)
+		mutex_exit(&GIANT_SERIAL_LOCK);
+#endif
 
 	if (CallbackData->Parameters.AcquireForSectionSynchronization.SyncType != SyncTypeCreateSection) {
 
@@ -4925,11 +4853,13 @@ NTSTATUS ZFSCallbackReleaseForCreateSection(
 	struct vnode *vp;
 	vp = CallbackData->FileObject->FsContext;
 
+	dprintf("%s: vp %p\n", __func__, vp);
+
 	ASSERT(vp != NULL);
 	if (vp == NULL) return STATUS_INVALID_PARAMETER;
 
 	if (vp->FileHeader.Resource) {
-		dprintf("%s: unlocked\n", __func__);
+		dprintf("%s: unlocked: %p\n", __func__, vp->FileHeader.Resource);
 		ExReleaseResourceLite(vp->FileHeader.Resource);
 #ifdef DEBUG_IOCOUNT
 		int nolock = 0;
